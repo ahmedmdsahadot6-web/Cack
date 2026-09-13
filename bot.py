@@ -311,9 +311,7 @@ LOG_CHANNEL = "@vucctx"
 SMM_API_URL = "https://1xpanel.com/api/v2"
 
 # 🐘 PostgreSQL Database URL (Neon DB) - Updated here
-DATABASE_URL = os.environ.get("DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://neondb_owner:npg_OnfpUAWvt45P@ep-round-field-ax1b01u8-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-).strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://neondb_owner:npg_I2jCL5wZTtMA@ep-super-sound-aeir42dz-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require").strip()
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
