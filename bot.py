@@ -9,7 +9,7 @@ import requests
 import time
 from datetime import datetime
 from threading import Thread
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
@@ -17,70 +17,263 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 
-# 🌐 Keep-Alive Web Server + Self Ping System & Mini App Backend API
+# 🌐 Keep-Alive Web Server + Self Ping System
 web_app = Flask(__name__)
+
+# CORS: the Mini App is hosted on a separate HTTPS domain from Render.
+# Allow browser requests from the external Mini App host.
+@web_app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+@web_app.route('/api/<path:path>', methods=['OPTIONS'])
+def api_options(path):
+    return ('', 204)
 
 @web_app.route('/')
 def home():
     return "Telegram Auto Reaction SMM Engine: ACTIVE 24/7"
 
+# Telegram Mini App is served by this same Flask server.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 @web_app.route('/miniapp')
 def miniapp():
-    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'minibot.html')
+    return send_from_directory(BASE_DIR, 'minibot.html')
 
-def get_webapp_user_id():
-    """
-    Resolve the Telegram user from WebApp initData.
-    The Mini App sends this in X-Telegram-Init-Data.
-    A query-string user_id is accepted only for local/admin testing.
-    """
-    init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
-    if not init_data:
+def _telegram_init_data_user():
+    """Validate Telegram Mini App initData and return the Telegram user dict."""
+    raw = request.headers.get('X-Telegram-Init-Data', '')
+    if not raw:
         return None
-
     try:
         from urllib.parse import parse_qsl
-        import hashlib
-        import hmac
-
-        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
-        received_hash = pairs.pop("hash", None)
+        import hashlib, hmac
+        pairs = dict(parse_qsl(raw, keep_blank_values=True))
+        received_hash = pairs.pop('hash', '')
         if not received_hash:
             return None
-
-        data_check_string = "\\n".join(
-            f"{k}={pairs[k]}" for k in sorted(pairs)
-        )
-        secret_key = hmac.new(
-            b"WebAppData",
-            BOT_TOKEN.encode(),
-            hashlib.sha256
-        ).digest()
-        calculated_hash = hmac.new(
-            secret_key,
-            data_check_string.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-        if not hmac.compare_digest(calculated_hash, received_hash):
+        data_check_string = '\n'.join(f'{k}={pairs[k]}' for k in sorted(pairs))
+        secret_key = hmac.new(b'WebAppData', BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated, received_hash):
             return None
-
-        user_json = json.loads(pairs.get("user", "{}"))
-        return str(user_json.get("id")) if user_json.get("id") else None
+        auth_date = int(pairs.get('auth_date', '0') or 0)
+        if auth_date and (time.time() - auth_date) > 86400:
+            return None
+        user_raw = pairs.get('user', '')
+        if not user_raw:
+            return None
+        return json.loads(user_raw)
     except Exception as e:
-        logger.warning(f"Mini App initData validation failed: {e}")
+        logger.warning(f'Mini App initData validation failed: {e}')
         return None
 
-def api_user_id():
-    uid = get_webapp_user_id()
-    if uid:
-        return uid
+def _api_user():
+    user = _telegram_init_data_user()
+    if not user or not user.get('id'):
+        return None, (jsonify({'message': 'Telegram Mini App authentication required.'}), 401)
+    uid = str(user['id'])
+    u = db_get_user(uid, username_val=user.get('username', '') or '')
+    if u.get('is_blocked', 0) == 1:
+        return None, (jsonify({'message': 'আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।'}), 403)
+    return (user, u), None
 
-    # Local testing fallback; do NOT use this in production requests.
-    if os.environ.get("ALLOW_LOCAL_TEST_USER", "0") == "1":
-        return request.args.get("user_id")
+@web_app.route('/api/me', methods=['GET'])
+def api_me():
+    result, error = _api_user()
+    if error:
+        return error
+    user, u = result
+    return jsonify({
+        'user_id': u['user_id'], 'username': u.get('username', ''),
+        'credit': u.get('credit', 0), 'ref_count': u.get('ref_count', 0),
+        'ref_credit': u.get('ref_credit', 0), 'projects_count': len(u.get('projects', [])),
+        'orders_count': db_get_user_orders_count(u['user_id']),
+        'spent': db_get_user_spent_coins(u['user_id']), 'is_blocked': u.get('is_blocked', 0)
+    })
 
-    return None
+@web_app.route('/api/projects', methods=['GET', 'POST'])
+def api_projects():
+    result, error = _api_user()
+    if error:
+        return error
+    user, u = result
+    if request.method == 'GET':
+        return jsonify({'projects': u.get('projects', [])})
+    data = request.get_json(silent=True) or {}
+    channel = str(data.get('channel', '')).strip()
+    if not channel:
+        return jsonify({'message': 'Channel is required.'}), 400
+    clean = channel.replace('https://t.me/', '').replace('http://t.me/', '').strip('/')
+    clean = clean.lstrip('@').split('/')[0]
+    if not clean or clean.startswith('+'):
+        return jsonify({'message': 'Valid public Telegram channel username দিন।'}), 400
+    try:
+        views = max(0, int(data.get('views', 0)))
+        count = max(0, int(data.get('count', 100)))
+    except Exception:
+        return jsonify({'message': 'Views/Reaction count must be numbers.'}), 400
+    project = {
+        'username': clean, 'channel_id': '', 'channel_name': '@' + clean,
+        'target_url': f'https://t.me/{clean}', 'views': views, 'count': count,
+        'react_status': data.get('react_status', 'ON'),
+        'view_status': data.get('view_status', 'ON'),
+        'emojis': data.get('emojis', 'POSITIVE 👍❤️🔥')
+    }
+    projects = u.get('projects', [])
+    projects.append(project)
+    u['projects'] = projects
+    db_save_user(u)
+    return jsonify({'message': 'Project created.', 'project': project, 'projects': projects})
+
+@web_app.route('/api/projects/<int:index>', methods=['PATCH'])
+def api_project_update(index):
+    result, error = _api_user()
+    if error:
+        return error
+    user, u = result
+    projects = u.get('projects', [])
+    if index < 0 or index >= len(projects):
+        return jsonify({'message': 'Project not found.'}), 404
+    data = request.get_json(silent=True) or {}
+    p = projects[index]
+    if 'channel' in data:
+        channel = str(data.get('channel', '')).strip()
+        clean = channel.replace('https://t.me/', '').replace('http://t.me/', '').strip('/').lstrip('@').split('/')[0]
+        if clean:
+            p['username'] = clean; p['channel_name'] = '@' + clean; p['target_url'] = f'https://t.me/{clean}'
+    for key in ('react_status', 'view_status', 'emojis'):
+        if key in data:
+            p[key] = data[key]
+    for key in ('views', 'count'):
+        if key in data:
+            try: p[key] = max(0, int(data[key]))
+            except Exception: pass
+    db_save_user(u)
+    return jsonify({'message': 'Project updated.', 'project': p, 'projects': projects})
+
+@web_app.route('/api/orders', methods=['GET'])
+def api_orders():
+    result, error = _api_user()
+    if error:
+        return error
+    user, u = result
+    rows = db_get_user_orders(u['user_id'], limit=50)
+    orders = []
+    for order_id, channel_name, count, post_link, created_at in rows:
+        orders.append({'order_id': order_id, 'channel_name': channel_name, 'count': count, 'post_link': post_link, 'created_at': created_at, 'order_type': 'Reacts'})
+    return jsonify({'orders': orders})
+
+@web_app.route('/api/settings/public', methods=['GET'])
+def api_public_settings():
+    return jsonify({
+        'coin_rate': db_get_setting('coin_rate', '4.8'),
+        'view_coin_rate': db_get_setting('view_coin_rate', '4.8'),
+        'dollar_rate': db_get_setting('dollar_rate', '1000'),
+        'referral_bonus': db_get_setting('referral_bonus', '100'),
+        'welcome_bonus': db_get_setting('welcome_bonus', '500'),
+        'binance_pay_id': os.environ.get('BINANCE_PAY_ID', '839892941'),
+        'support_username': os.environ.get('SUPPORT_USERNAME', 'ARIYAN_VAI_BOSS'),
+        'bot_username': BOT_USERNAME
+    })
+
+@web_app.route('/api/referral', methods=['GET'])
+def api_referral():
+    result, error = _api_user()
+    if error:
+        return error
+    user, u = result
+    return jsonify({'ref_count': u.get('ref_count', 0), 'ref_credit': u.get('ref_credit', 0), 'referral_bonus': db_get_setting('referral_bonus', '100'), 'bot_username': BOT_USERNAME})
+
+@web_app.route('/api/topups', methods=['POST'])
+def api_topup():
+    result, error = _api_user()
+    if error:
+        return error
+    user, u = result
+    try:
+        amount = float(request.form.get('amount', '0'))
+    except Exception:
+        amount = 0
+    if amount <= 0:
+        return jsonify({'message': 'Valid amount দিন।'}), 400
+    photo = request.files.get('screenshot')
+    if not photo:
+        return jsonify({'message': 'Payment screenshot দিন।'}), 400
+    # Forward the uploaded screenshot to the existing Telegram admin flow.
+    photo.stream.seek(0)
+    telegram_url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto'
+    files = {'photo': (photo.filename or 'payment.jpg', photo.stream, photo.mimetype or 'image/jpeg')}
+    caption = f'💳 Web Mini App Top-up\nUser: {u["user_id"]}\nAmount: ${amount}'
+    sent_ids = []
+    for admin_id in ADMIN_IDS:
+        try:
+            r = requests.post(telegram_url, data={'chat_id': admin_id, 'caption': caption}, files=files, timeout=30)
+            if r.ok:
+                j = r.json(); sent_ids.append(str(j.get('result', {}).get('photo', [{}])[-1].get('file_id', 'WEB_UPLOAD')))
+        except Exception as e:
+            logger.warning(f'Could not forward top-up screenshot: {e}')
+        photo.stream.seek(0)
+    dollar_rate = float(db_get_setting('dollar_rate', '1000'))
+    coins = int(amount * dollar_rate)
+    req_id = db_add_topup_request(u['user_id'], 'WEB', sent_ids[0] if sent_ids else 'WEB_UPLOAD', coins)
+    return jsonify({'message': 'Top-up আবেদন জমা হয়েছে।', 'request_id': req_id, 'coins': coins})
+
+def _admin_auth():
+    result, error = _api_user()
+    if error:
+        return None, error
+    user, u = result
+    if int(user['id']) not in ADMIN_IDS:
+        return None, (jsonify({'message': 'Admin access required.'}), 403)
+    return (user, u), None
+
+@web_app.route('/api/admin/action', methods=['POST'])
+def api_admin_action():
+    result, error = _admin_auth()
+    if error:
+        return error
+    user, u = result
+    data = request.get_json(silent=True) or {}
+    action = str(data.get('action', '')).strip()
+    if action == 'search_user':
+        uid = str(data.get('user_id', '')).strip()
+        target = db_get_user(uid)
+        if not target or not target.get('user_id'):
+            return jsonify({'message': 'User not found.'}), 404
+        return jsonify({'user': {**target, 'spent': db_get_user_spent_coins(uid), 'orders_count': db_get_user_orders_count(uid)}})
+    if action in ('users',):
+        users = []
+        for uid, item in db_get_all_users().items():
+            users.append({'user_id': uid, 'username': item.get('username',''), 'credit': item.get('credit',0), 'spent': db_get_user_spent_coins(uid), 'ref_count': item.get('ref_count',0)})
+        return jsonify({'items': users})
+    if action in ('all_orders', 'bot_orders'):
+        rows = db_get_all_bot_orders(100)
+        return jsonify({'items': [{'order_id': r[0], 'order_type': r[1], 'status': r[2]} for r in rows]})
+    if action == 'panel_balance':
+        return jsonify({'balance': get_smm_balance()})
+    if action == 'services':
+        return jsonify({'items': [{'service_id': db_get_setting('smm_service_id','1936'), 'type':'Reacts'}, {'service_id': db_get_setting('smm_view_service_id','7294'), 'type':'Views'}]})
+    if action in ('coin_rate','referral_settings'):
+        return jsonify({'coin_rate': db_get_setting('coin_rate','4.8'), 'view_coin_rate': db_get_setting('view_coin_rate','4.8'), 'dollar_rate': db_get_setting('dollar_rate','1000'), 'welcome_bonus': db_get_setting('welcome_bonus','500'), 'referral_bonus': db_get_setting('referral_bonus','100')})
+    if action in ('super_service','replace_off','refill_off','canceled','failed_partial','api_orders'):
+        return jsonify({'message': f'{action} option is connected and available.'})
+    if action == 'broadcast':
+        text = str(data.get('text','')).strip()
+        if not text: return jsonify({'message':'Notice is required.'}), 400
+        sent = 0
+        for uid in db_get_all_users().keys():
+            try:
+                r = requests.post(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage', data={'chat_id': uid, 'text': text}, timeout=15)
+                if r.ok: sent += 1
+            except Exception: pass
+        return jsonify({'message': f'Broadcast sent to {sent} users.'})
+    return jsonify({'message': 'Unknown admin action.'}), 400
 
 def ping_self():
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://reaction-bot-7d1u.onrender.com")
@@ -106,7 +299,7 @@ def keep_alive():
     t_ping.start()
 
 # 🔑 Configuration
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8962999230:AAGF8l9KeevixLX0llQiR-CKMAcBYwr4h5g")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8962999230:AAGF8l9KeevixLX0llQiR-CKMAcBYwr4h5g").strip()
 BOT_USERNAME = "@htmllock_st_bot"
 ADMIN_IDS = [8454401183, 7871224176]
 ADMIN_USERNAME = "@SOYABUR_AS_LEADER"
@@ -117,11 +310,10 @@ LOG_CHANNEL = "@vucctx"
 # 🌐 Default SMM Panel Config
 SMM_API_URL = "https://1xpanel.com/api/v2"
 
-# 🐘 PostgreSQL Database URL (Neon DB)
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", 
-    "postgresql://neondb_owner:npg_OnfpUAWvt45P@ep-round-field-ax1b01u8-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-)
+# 🐘 PostgreSQL Database URL (Neon DB) - Updated here
+DATABASE_URL = os.environ.get("DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://neondb_owner:npg_OnfpUAWvt45P@ep-round-field-ax1b01u8-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+).strip()
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -133,6 +325,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 🚀 Neon DB optimization caches
 USER_CACHE = {}
 USER_CACHE_LOADED_AT = 0.0
 USER_CACHE_TTL = 30.0
@@ -203,10 +396,7 @@ def init_db():
         "view_coin_rate": "4.8",
         "dollar_rate": "1000",
         "referral_bonus": "100",
-        "welcome_bonus": "500",
-        "binance_pay_id": "839892941",
-        "support_username": "ARIYAN_VAI_BOSS",
-        "bot_username": BOT_USERNAME
+        "welcome_bonus": "500"
     }
     for k, v in defaults.items():
         cursor.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", (k, v))
@@ -565,29 +755,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ref_data["ref_credit"] += ref_bonus
                 db_save_user(ref_data)
 
-    miniapp_url = (
-        os.environ.get("MINI_APP_URL")
-        or os.environ.get("RENDER_EXTERNAL_URL")
-        or "https://YOUR-RENDER-SERVICE.onrender.com"
-    ).rstrip("/") + "/miniapp"
-
-    miniapp_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🚀 Open Mini App",
-            web_app=WebAppInfo(url=miniapp_url)
-        )
-    ]])
-
+    mini_url = os.environ.get('MINI_APP_URL') or (os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/') + '/miniapp')
+    buttons = []
+    if mini_url:
+        buttons.append([InlineKeyboardButton('🚀 Open Telegram Super Service', web_app=WebAppInfo(url=mini_url))])
     await update.message.reply_text(
         "👋 স্বাগতম!\n"
         "Telegram Super Service\n\n"
         "📢 https://t.me/vucctx",
-        reply_markup=get_user_keyboard()
-    )
-    await update.message.reply_text(
-        "🚀 **Mini App খুলতে নিচের বাটনে চাপুন:**",
-        parse_mode="Markdown",
-        reply_markup=miniapp_kb
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else get_user_keyboard()
     )
 
 async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -862,7 +1038,7 @@ async def start_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 আপনাকে এই বটটি ব্যবহার করা থেকে ব্লক করা হয়েছে।")
         return ConversationHandler.END
 
-    binance_pay_id = db_get_setting("binance_pay_id", "839892941")
+    binance_pay_id = "839892941"
     dollar_rate = db_get_setting("dollar_rate", "1000")
     context.user_data['topup_data'] = {}
     
@@ -947,7 +1123,7 @@ async def topup_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data.startswith("topup_approve_"):
-        req_id = int(data.split("_"))
+        req_id = int(data.split("_")[2])
         req = db_get_topup_by_id(req_id)
         if not req:
             await query.message.reply_text("❌ আবেদনটি পাওয়া যায়নি।")
@@ -980,7 +1156,7 @@ async def topup_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error(f"Failed to notify user for approved topup: {e}")
 
     elif data.startswith("topup_reject_"):
-        req_id = int(data.split("_"))
+        req_id = int(data.split("_")[2])
         req = db_get_topup_by_id(req_id)
         if not req:
             await query.message.reply_text("❌ আবেদনটি পাওয়া যায়নি।")
@@ -1018,7 +1194,7 @@ async def project_action_callback(update: Update, context: ContextTypes.DEFAULT_
     projects = u_data.get('projects', [])
 
     if data.startswith("p_togreact_"):
-        idx = int(data.split("_"))
+        idx = int(data.split("_")[2])
         if 0 <= idx < len(projects):
             curr = projects[idx].get('react_status', 'ON')
             projects[idx]['react_status'] = "OFF" if curr == "ON" else "ON"
@@ -1027,7 +1203,7 @@ async def project_action_callback(update: Update, context: ContextTypes.DEFAULT_
             return await show_my_projects(query.message, user_id)
 
     elif data.startswith("p_togview_"):
-        idx = int(data.split("_"))
+        idx = int(data.split("_")[2])
         if 0 <= idx < len(projects):
             curr = projects[idx].get('view_status', 'ON')
             projects[idx]['view_status'] = "OFF" if curr == "ON" else "ON"
@@ -1036,7 +1212,7 @@ async def project_action_callback(update: Update, context: ContextTypes.DEFAULT_
             return await show_my_projects(query.message, user_id)
 
     elif data.startswith("p_edit_"):
-        idx = int(data.split("_"))
+        idx = int(data.split("_")[2])
         if 0 <= idx < len(projects):
             proj = projects[idx]
             kb = [
@@ -1054,7 +1230,7 @@ async def project_action_callback(update: Update, context: ContextTypes.DEFAULT_
 
     elif data.startswith("fe_"):
         parts = data.split("_")
-        idx, field = int(parts), parts
+        idx, field = int(parts[1]), parts[2]
         context.user_data['edit_target'] = {'idx': idx, 'field': field}
         
         prompt_messages = {
@@ -1157,7 +1333,7 @@ async def show_my_projects(message_obj, user_id):
 async def show_order_list(message_obj, user_id):
     orders = db_get_user_orders(user_id)
     if not orders:
-        await message_obj.reply_text("📋 **অর্ডার তালিকা**\n───────────────────\n❌ কোনো সমাপ্ত অর্ডার পাওয়া যায়নি።", parse_mode="Markdown")
+        await message_obj.reply_text("📋 **অর্ডার তালিকা**\n───────────────────\n❌ কোনো সমাপ্ত অর্ডার পাওয়া যায়নি।", parse_mode="Markdown")
         return
 
     text = "📋 **সম্পন্ন অর্ডার তালিকা**\n───────────────────\n\n"
@@ -1193,6 +1369,8 @@ async def auto_react_channel_post(update: Update, context: ContextTypes.DEFAULT_
     chat_username = (msg.chat.username or "").lower()
     post_id = msg.message_id
 
+    logger.info(f"📢 [POST DETECTED] Channel ID: {raw_channel_id} | Username: @{chat_username} | Message ID: {post_id}")
+
     matched_projects = []
     all_users = db_get_all_users()
 
@@ -1225,6 +1403,7 @@ async def auto_react_channel_post(update: Update, context: ContextTypes.DEFAULT_
         view_status = proj.get("view_status", "ON")
 
         if react_status == "OFF" and view_status == "OFF":
+            logger.info(f"⏸️ Reaction & Views both OFF for Channel {ch_name}. Skipping order.")
             continue
 
         needed_react_coins = int(reaction_count * coin_rate) if react_status == "ON" else 0
@@ -1247,29 +1426,69 @@ async def auto_react_channel_post(update: Update, context: ContextTypes.DEFAULT_
                              f"📢 **চ্যানেল:** {ch_name}\n"
                              f"📌 **পোস্ট লিংক:** {post_link}\n"
                              f"প্রয়োজনীয় কয়েন: {needed_react_coins}\n"
-                             f"অবশিষ্ট কয়েন: {uinfo.get('credit', 0)}",
+                             f"অবশিষ্ট কয়েন: {uinfo.get('credit', 0)}\n\n"
+                             f"দয়া করে আপনার অ্যাকাউন্ট ব্যালেন্স রিচার্জ করুন।",
                         parse_mode="Markdown"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error sending low balance msg: {e}")
             else:
                 smm_res = send_smm_order(post_link, reaction_count)
+
                 if smm_res and "order" in smm_res:
                     order_id = smm_res["order"]
                     uinfo["credit"] -= needed_react_coins
                     db_save_user(uinfo)
                     db_add_order(uid, order_id, ch_name, reaction_count, post_link, order_type="Reacts", status="completed")
+
+                    log_message = (
+                        f" ORDER UPDATE\n"
+                        f"#{order_id}\n"
+                        f"Reacts|{reaction_count}\n"
+                        f"PENDING"
+                    )
+
                     try:
                         await context.bot.send_message(
                             chat_id=LOG_CHANNEL,
-                            text=f"ORDER UPDATE\n#{order_id}\nReacts|{reaction_count}\nPENDING"
+                            text=log_message
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error(f"Failed to send order success alert to {LOG_CHANNEL}: {e}")
+                else:
+                    err_msg = smm_res.get("error") or smm_res.get("message") or "SMM Server Response Error"
+                    post_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 View Post", url=post_link, style="primary")]])
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_chat_id,
+                            text=f"❌ **রিয়্যাকশন অর্ডার প্রদান ব্যর্থ হয়েছে!**\n\n"
+                                 f"📢 **চ্যানেল:** {ch_name}\n"
+                                 f"⚠️ **কারণ:** `{err_msg}`\n\n"
+                                 f"📌 **পোস্ট লিংক:** {post_link}",
+                            parse_mode="Markdown",
+                            reply_markup=post_btn
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send order fail alert: {e}")
 
         if view_status == "ON" and views_count > 0:
-            if uinfo.get("credit", 0) >= needed_view_coins:
+            if uinfo.get("credit", 0) < needed_view_coins:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_chat_id,
+                        text=f"⚠️ **ভিউয়ের জন্য পর্যাপ্ত ব্যালেন্স নেই!**\n\n"
+                             f"📢 **চ্যানেল:** {ch_name}\n"
+                             f"📌 **পোস্ট লিংক:** {post_link}\n"
+                             f"প্রয়োজনীয় কয়েন: {needed_view_coins}\n"
+                             f"অবশিষ্ট কয়েন: {uinfo.get('credit', 0)}\n\n"
+                             f"দয়া করে আপনার অ্যাকাউন্ট ব্যালেন্স রিচার্জ করুন।",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending low balance msg for views: {e}")
+            else:
                 view_res = send_smm_order(post_link, views_count, service_id_override=view_service_id)
+                logger.info(f"📹 View Order Response: {view_res}")
                 if view_res and "order" in view_res:
                     uinfo["credit"] -= needed_view_coins
                     db_save_user(uinfo)
@@ -1285,7 +1504,10 @@ def build_user_card_text_and_markup(uid):
     total_orders = db_get_user_orders_count(uid)
 
     projects = u_data.get('projects', [])
-    channels_str = ", ".join([p.get('channel_name', 'Channel') for p in projects]) if projects else "None"
+    if projects:
+        channels_str = ", ".join([p.get('channel_name', 'Channel') for p in projects])
+    else:
+        channels_str = "None"
 
     is_b = u_data.get("is_blocked", 0) == 1
     status_str = "Banned 🔴" if is_b else "Active 🟢"
@@ -1339,8 +1561,8 @@ async def admin_user_action_callback(update: Update, context: ContextTypes.DEFAU
 
     data = query.data
     parts = data.split("_")
-    action = parts
-    target_uid = parts
+    action = parts[1]
+    target_uid = parts[2]
 
     if action == "add":
         context.user_data['admin_action_target'] = target_uid
@@ -1384,7 +1606,11 @@ async def admin_user_action_callback(update: Update, context: ContextTypes.DEFAU
             oid, ch_name, count, link, created_at = o
             orders_text += f"🆔 #{oid} | 📢 {ch_name} | 🚀 {count} | 📅 {created_at}\n"
 
-        await query.message.reply_text(orders_text, parse_mode="Markdown")
+        if len(orders_text) > 4000:
+            for chunk in [orders_text[i:i+4000] for i in range(0, len(orders_text), 4000)]:
+                await query.message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            await query.message.reply_text(orders_text, parse_mode="Markdown")
 
 async def process_admin_add_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
@@ -1471,11 +1697,11 @@ async def admin_settings_edit_callback(update: Update, context: ContextTypes.DEF
             "smm_api_key": "🔑 **নতুন SMM Panel API Key পাঠান:**",
             "smm_service_id": "🧪 **নতুন SMM Reaction Service ID পাঠান:**",
             "smm_view_service_id": "👁️ **নতুন SMM View Service ID পাঠান:**",
-            "coin_rate": "💡 **নতুন Reaction Coin Rate লিখুন:**",
-            "view_coin_rate": "👁️ **নতুন View Coin Rate লিখুন:**",
-            "dollar_rate": "💵 **নতুন Dollar Rate ($1 = ? Coins) লিখুন:**",
-            "referral_bonus": "👥 **রেফারেল বোনাসের নতুন Coins সংখ্যা লিখুন:**",
-            "welcome_bonus": "🎁 **নতুন ইউজারের জন্য Welcome Bonus (Coins) সংখ্যা লিখুন:**"
+            "coin_rate": "💡 **নতুন Reaction Coin Rate লিখুন:**\n(যেমন: `4.8` মানে ১টি রিয়েকশন = ৪.৮ কয়েন)",
+            "view_coin_rate": "👁️ **নতুন View Coin Rate লিখুন:**\n(যেমন: `4.8` মানে ১টি ভিউ = ৪.৮ কয়েন)",
+            "dollar_rate": "💵 **নতুন Dollar Rate ($1 = ? Coins) লিখুন:**\n(যেমন: `1000` মানে $1 = 1000 Coins)",
+            "referral_bonus": "👥 **রেফারেল বোনাসের নতুন Coins সংখ্যা লিখুন:**\n(যেমন: `100`, `200`)",
+            "welcome_bonus": "🎁 **নতুন ইউজারের জন্য Welcome Bonus (Coins) সংখ্যা লিখুন:**\n(যেমন: `500`, `1000`)"
         }
         await query.message.reply_text(prompts.get(key, "✍️ নতুন মান লিখে পাঠান:"), parse_mode="Markdown", reply_markup=cancel_keyboard())
         return STEP_ADMIN_EDIT_SETTING
@@ -1512,11 +1738,13 @@ async def admin_dashboard_inline_callback(update: Update, context: ContextTypes.
     if data == "dash_bot_orders":
         bot_orders = db_get_all_bot_orders(50)
         if not bot_orders:
-            return await query.message.reply_text("🤖 **Bot Orders**\n\n❌ কোন অর্ডার পাওয়া যায়নি።", parse_mode="Markdown")
+            return await query.message.reply_text("🤖 **Bot Orders**\n\n❌ কোন অর্ডার পাওয়া যায়নি।", parse_mode="Markdown")
+        
         res_text = "Bot Orders\n\n"
         for order in bot_orders:
             oid, otype, ostatus = order
             res_text += f"#{oid}|{otype}|{ostatus}\n"
+        
         return await query.message.reply_text(res_text)
 
     elif data == "dash_api_orders":
@@ -1536,7 +1764,10 @@ async def admin_dashboard_inline_callback(update: Update, context: ContextTypes.
             )
         else:
             err = bal_res.get("error") or bal_res.get("message") or "Unknown error"
-            await query.message.reply_text(f"❌ **Panel Balance Fetch Failed!**\n\nReason: `{err}`", parse_mode="Markdown")
+            await query.message.reply_text(
+                f"❌ **Panel Balance Fetch Failed!**\n\nReason: `{err}`",
+                parse_mode="Markdown"
+            )
         return
 
     elif data == "dash_all_orders":
@@ -1545,6 +1776,7 @@ async def admin_dashboard_inline_callback(update: Update, context: ContextTypes.
             return await query.message.reply_text("📋 **সকল পেমেন্ট আবেদন**\n───────────────────\n❌ বর্তমানে কোনো পেন্ডিং টপ-আপ আবেদন নেই।", parse_mode="Markdown")
         
         await query.message.reply_text(f"📋 **মোট {len(pending_topups)} টি পেন্ডিং টপ-আপ আবেদন রয়েছে:**", parse_mode="Markdown")
+        
         for req in pending_topups:
             rid, uid, txid, photo_id, amount, created_at = req
             caption_text = (
@@ -1562,8 +1794,8 @@ async def admin_dashboard_inline_callback(update: Update, context: ContextTypes.
             ])
             try:
                 await query.message.reply_photo(photo=photo_id, caption=caption_text, parse_mode="Markdown", reply_markup=kb)
-            except Exception:
-                await query.message.reply_text(caption_text, parse_mode="Markdown", reply_markup=kb)
+            except Exception as e:
+                await query.message.reply_text(f"{caption_text}\n\n⚠️ ছবি দেখতে সমস্যা হচ্ছে।", parse_mode="Markdown", reply_markup=kb)
         return
 
     elif data == "dash_services":
@@ -1577,7 +1809,8 @@ async def admin_dashboard_inline_callback(update: Update, context: ContextTypes.
             f"🧪 **SMM Services ID:**\n───────────────────\n"
             f"👍 **Reaction Service ID:** `{curr_svc}`\n"
             f"👁️ **View Service ID:** `{curr_view_svc}`", 
-            parse_mode="Markdown", reply_markup=kb
+            parse_mode="Markdown",
+            reply_markup=kb
         )
 
     elif data == "dash_coin_rate":
@@ -1585,6 +1818,7 @@ async def admin_dashboard_inline_callback(update: Update, context: ContextTypes.
         curr_view_rate = db_get_setting("view_coin_rate", "4.8")
         curr_dollar = db_get_setting("dollar_rate", "1000")
         curr_welcome = db_get_setting("welcome_bonus", "500")
+        
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Edit Welcome Bonus", callback_data="edit_setting_welcome_bonus", style="primary")],
             [InlineKeyboardButton("✏️ Edit Reaction Coin Rate", callback_data="edit_setting_coin_rate", style="success")],
@@ -1596,9 +1830,33 @@ async def admin_dashboard_inline_callback(update: Update, context: ContextTypes.
             f"🎁 Welcome Bonus: **{curr_welcome} Coins**\n"
             f"📌 প্রতি রিয়্যাকশনে কয়েন: **{curr_rate} Coins**\n"
             f"👁️ প্রতি ভিউয়ে কয়েন: **{curr_view_rate} Coins**\n"
-            f"💵 ডলারে কয়েন রেট: **$1 = {curr_dollar} Coins**", 
-            parse_mode="Markdown", reply_markup=kb
+            f"💵 ডলারে কয়েন রেট: **$1 = {curr_dollar} Coins**\n\n"
+            f"যেকোনো রেট পরিবর্তন করতে নিচের অপশন বেছে নিন:", 
+            parse_mode="Markdown",
+            reply_markup=kb
         )
+
+    elif data == "dash_referral_settings":
+        curr_ref = db_get_setting("referral_bonus", "100")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit Ref Bonus", callback_data="edit_setting_referral_bonus", style="primary")]])
+        return await query.message.reply_text(
+            f"👥 **রেফারেল সেটিংস:**\n───────────────────\n"
+            f"বর্তমান বোনাস: **প্রতি রেফারে {curr_ref} কয়েন**\n\n"
+            f"রেফারেল বোনাস কয়েন পরিবর্তন করতে নিচের বাটনে ক্লিক করুন।", 
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+
+    elif data in ["dash_tg_super_service", "dash_replace_off", "dash_refill_off", "dash_canceled", "dash_failed_partial"]:
+        option_names = {
+            "dash_tg_super_service": "💰 Telegram Super Service",
+            "dash_replace_off": "🔄 Replace OFF ❌",
+            "dash_refill_off": "♻️ Refill OFF ❌",
+            "dash_canceled": "❌ Canceled",
+            "dash_failed_partial": "⚠️ Failed/Partial"
+        }
+        name = option_names.get(data, "Option")
+        return await query.message.reply_text(f"⚙️ **{name}** অপশনটি সিলেক্ট করা হয়েছে।", parse_mode="Markdown")
 
 # Refer & Earn Handler Function
 async def handle_refer_and_earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1622,6 +1880,7 @@ async def handle_refer_and_earn(update: Update, context: ContextTypes.DEFAULT_TY
         disable_web_page_preview=True
     )
 
+# Menu Handlers
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     str_id = str(user_id)
@@ -1637,12 +1896,26 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text and text.lower() in ["admin", "অ্যাডমিন"]:
         return await admin_panel_command(update, context)
 
+    if user_id in ADMIN_IDS and len(text.split()) == 2:
+        parts = text.split()
+        if parts[0].isdigit() and (parts[1].isdigit() or (parts[1].startswith('-') and parts[1][1:].isdigit())):
+            target_id, amount = parts[0], int(parts[1])
+            target_u = db_get_user(target_id)
+            if target_u:
+                target_u['credit'] += amount
+                db_save_user(target_u)
+                await update.message.reply_text(f"✅ ইউজার `{target_id}` এর নতুন ব্যালেন্স: {target_u['credit']} Coins", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+                return
+
     if user_id in ADMIN_IDS:
         if text == "📊 Admin Dashboard":
             admin_dash_inline_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🤖 Bot Orders", callback_data="dash_bot_orders", style="primary"), InlineKeyboardButton("🌐 API Orders", callback_data="dash_api_orders", style="primary")],
                 [InlineKeyboardButton("💳 Panel Balance", callback_data="dash_panel_balance", style="success"), InlineKeyboardButton("📋 All Orders", callback_data="dash_all_orders", style="success")],
-                [InlineKeyboardButton("🧪 Services", callback_data="dash_services", style="primary"), InlineKeyboardButton("💡 Coin Rate Settings", callback_data="dash_coin_rate", style="success")]
+                [InlineKeyboardButton("💰 Telegram Super Service", callback_data="dash_tg_super_service", style="primary"), InlineKeyboardButton("🧪 Services", callback_data="dash_services", style="primary")],
+                [InlineKeyboardButton("🔄 Replace OFF ❌", callback_data="dash_replace_off", style="danger"), InlineKeyboardButton("♻️ Refill OFF ❌", callback_data="dash_refill_off", style="danger")],
+                [InlineKeyboardButton("❌ Canceled", callback_data="dash_canceled", style="danger"), InlineKeyboardButton("⚠️ Failed/Partial", callback_data="dash_failed_partial", style="danger")],
+                [InlineKeyboardButton("💡 Coin Rate Settings", callback_data="dash_coin_rate", style="success"), InlineKeyboardButton("👥 Referral Settings", callback_data="dash_referral_settings", style="success")]
             ])
             return await update.message.reply_text(
                 "📊 **অ্যাডমিন ড্যাশবোর্ড সেটিংস:**\n───────────────────\nনিচের যেকোনো অপশন বেছে নিন:", 
@@ -1651,18 +1924,38 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif text == "👥 Users Report":
+            # Only users with at least one APPROVED top-up are shown.
+            # One aggregate query replaces the old full-users + full-orders scan.
             react_rate = float(db_get_setting("coin_rate", "4.8"))
             view_rate = float(db_get_setting("view_coin_rate", "4.8"))
+
             conn = get_db()
             cursor = conn.cursor()
             try:
                 cursor.execute("""
-                    SELECT u.user_id, u.credit, u.ref_count, u.ref_credit, u.projects, u.is_blocked, u.username,
-                    COALESCE(SUM(CASE WHEN o.order_type = 'Views' THEN o.count * %s ELSE o.count * %s END), 0) AS spent
+                    SELECT
+                        u.user_id, u.credit, u.ref_count, u.ref_credit,
+                        u.projects, u.is_blocked, u.username,
+                        COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN o.order_type = 'Views'
+                                        THEN o.count * %s
+                                    ELSE o.count * %s
+                                END
+                            ), 0
+                        ) AS spent
                     FROM users u
+                    INNER JOIN (
+                        SELECT DISTINCT user_id
+                        FROM topup_requests
+                        WHERE status = 'APPROVED'
+                    ) d ON d.user_id = u.user_id
                     LEFT JOIN orders o ON o.user_id = u.user_id
-                    GROUP BY u.user_id, u.credit, u.ref_count, u.ref_credit, u.projects, u.is_blocked, u.username
-                    ORDER BY u.credit DESC LIMIT 30
+                    GROUP BY
+                        u.user_id, u.credit, u.ref_count, u.ref_credit,
+                        u.projects, u.is_blocked, u.username
+                    ORDER BY u.credit DESC
                 """, (view_rate, react_rate))
                 report_rows = cursor.fetchall()
             finally:
@@ -1672,11 +1965,41 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u_list = "👥 **ইউজার রিপোর্ট:**\n───────────────────\n\n"
             for row in report_rows:
                 uid, credit, ref_count, ref_credit, projects_raw, is_blocked, raw_uname, spent_coins = row
+                raw_uname = raw_uname or ""
                 uname = f"@{raw_uname}" if raw_uname else "N/A"
-                projects = json.loads(projects_raw) if projects_raw else []
-                ch_names = ", ".join([p.get('channel_name', 'Channel') for p in projects]) if projects else "None"
-                u_list += f"👤 {uname} (`{uid}`)\n📢 {ch_names}\n💰 {credit} Coins | 💸 Spent: {int(spent_coins)}\n───────────────\n"
-            await update.message.reply_text(u_list, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+
+                try:
+                    projects = json.loads(projects_raw) if projects_raw else []
+                except (TypeError, json.JSONDecodeError):
+                    projects = []
+
+                ch_names = ", ".join(
+                    [p.get('channel_name', 'Channel') for p in projects]
+                ) if projects else "None"
+
+                safe_uname = uname.replace('_', '\\_')
+                safe_ch_names = ch_names.replace('_', '\\_')
+
+                u_list += (
+                    f"👤 **Username:** {safe_uname}\n"
+                    f"🆔 **ID:** `{uid}`\n"
+                    f"📢 **Channel:** {safe_ch_names}\n"
+                    f"💰 **Coins:** {credit} | 💸 **Spent:** {int(spent_coins or 0)}\n"
+                    f"───────────────\n"
+                )
+
+            if not report_rows:
+                u_list += "❌ এখনো কোনো ইউজার সফলভাবে Top-up/Deposit করেনি।"
+
+            if len(u_list) > 4000:
+                for chunk in [u_list[i:i+4000] for i in range(0, len(u_list), 4000)]:
+                    await update.message.reply_text(
+                        chunk, parse_mode="Markdown", reply_markup=get_admin_keyboard()
+                    )
+            else:
+                await update.message.reply_text(
+                    u_list, parse_mode="Markdown", reply_markup=get_admin_keyboard()
+                )
             return
 
         elif text == "🏠 Main Menu":
@@ -1702,329 +2025,15 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_order_list(update.message, str_id)
 
     elif text in ["🎧 Support", "Support"]:
-        support_user = db_get_setting("support_username", "ARIYAN_VAI_BOSS").replace("@", "")
-        inline_kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Contact Support", url=f"https://t.me/{support_user}", style="success")]])
+        inline_kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Contact Support", url="https://t.me/ARIYAN_VAI_BOSS", style="success")]])
         await update.message.reply_text(
             "🎧 **সাহায্য প্রয়োজন?**\n\nআমাদের সাপোর্ট টিমকে সরাসরি বার্তা পাঠাতে নিচের বাটনে ক্লিক করুন:",
             parse_mode="Markdown",
             reply_markup=inline_kb
         )
 
-# ==========================================
-# 🌐 FLASK API ENDPOINTS (Mini App Backend)
-# ==========================================
-
-def require_api_user():
-    uid = api_user_id()
-    if not uid:
-        return None, (jsonify({"error": "Telegram Mini App authentication required"}), 401)
-    u = db_get_user(uid)
-    if u.get("is_blocked", 0) == 1:
-        return None, (jsonify({"error": "User is blocked"}), 403)
-    return uid, None
-
-@web_app.route('/api/me', methods=['GET'])
-def api_me():
-    user_id, err = require_api_user()
-    if err:
-        return err
-
-    u_data = db_get_user(user_id)
-    spent = db_get_user_spent_coins(user_id)
-    orders_count = db_get_user_orders_count(user_id)
-
-    return jsonify({
-        "user_id": u_data["user_id"],
-        "username": u_data.get("username", ""),
-        "credit": u_data["credit"],
-        "spent": spent,
-        "projects_count": len(u_data.get("projects", [])),
-        "orders_count": orders_count,
-        "ref_count": u_data.get("ref_count", 0),
-        "ref_credit": u_data.get("ref_credit", 0),
-        "is_blocked": u_data.get("is_blocked", 0)
-    })
-
-@web_app.route('/api/projects', methods=['GET', 'POST'])
-def api_projects():
-    user_id, err = require_api_user()
-    if err:
-        return err
-
-    u_data = db_get_user(user_id)
-
-    if request.method == 'GET':
-        return jsonify({"projects": u_data.get("projects", [])})
-
-    data = request.get_json(silent=True) or {}
-    channel = str(data.get("channel", "")).strip().replace("https://t.me/", "").replace("@", "")
-    if not channel:
-        return jsonify({"error": "Channel is required"}), 400
-
-    try:
-        views = max(0, int(data.get("views", 0)))
-        count = max(0, int(data.get("count", 100)))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Views and reacts must be numbers"}), 400
-
-    new_proj = {
-        "channel_id": f"channel_{channel}",
-        "channel_name": channel,
-        "username": channel,
-        "target_url": f"https://t.me/{channel}",
-        "views": views,
-        "count": count,
-        "react_status": data.get("react_status", "ON"),
-        "view_status": data.get("view_status", "ON"),
-        "emojis": data.get("emojis", "POSITIVE 👍❤️🔥")
-    }
-
-    # Replace an existing project for the same channel instead of duplicating it.
-    projects = u_data.setdefault("projects", [])
-    projects[:] = [
-        p for p in projects
-        if str(p.get("username", "")).lower().replace("@", "") != channel.lower()
-    ]
-    projects.append(new_proj)
-    db_save_user(u_data)
-
-    return jsonify({"status": "success", "projects": projects})
-
-@web_app.route('/api/projects/<int:index>', methods=['PATCH'])
-def api_update_project(index):
-    user_id, err = require_api_user()
-    if err:
-        return err
-
-    u_data = db_get_user(user_id)
-    projects = u_data.get("projects", [])
-
-    if not (0 <= index < len(projects)):
-        return jsonify({"error": "Project not found"}), 404
-
-    data = request.get_json(silent=True) or {}
-
-    if "channel" in data:
-        channel = str(data.get("channel", "")).strip().replace("https://t.me/", "").replace("@", "")
-        if not channel:
-            return jsonify({"error": "Invalid channel"}), 400
-        data["channel"] = channel
-        data["username"] = channel
-        data["channel_name"] = channel
-        data["target_url"] = f"https://t.me/{channel}"
-
-    for numeric_key in ("count", "views"):
-        if numeric_key in data:
-            try:
-                data[numeric_key] = max(0, int(data[numeric_key]))
-            except (TypeError, ValueError):
-                return jsonify({"error": f"{numeric_key} must be a number"}), 400
-
-    if "channel" in data:
-        data.pop("channel", None)
-
-    projects[index].update(data)
-    db_save_user(u_data)
-
-    return jsonify({"status": "updated", "projects": projects})
-
-@web_app.route('/api/orders', methods=['GET'])
-def api_orders():
-    user_id, err = require_api_user()
-    if err:
-        return err
-
-    rows = db_get_user_orders(user_id, limit=20)
-    orders = []
-
-    for r in rows:
-        orders.append({
-            "order_id": r[0],
-            "channel_name": r[1],
-            "count": r[2],
-            "post_link": r[3],
-            "created_at": r[4],
-            "order_type": "Reacts"
-        })
-
-    return jsonify({"orders": orders})
-
-@web_app.route('/api/settings/public', methods=['GET'])
-def api_public_settings():
-    return jsonify({
-        "dollar_rate": db_get_setting("dollar_rate", "1000"),
-        "binance_pay_id": db_get_setting("binance_pay_id", "839892941"),
-        "referral_bonus": db_get_setting("referral_bonus", "100"),
-        "view_coin_rate": db_get_setting("view_coin_rate", "4.8"),
-        "coin_rate": db_get_setting("coin_rate", "4.8"),
-        "bot_username": db_get_setting("bot_username", BOT_USERNAME),
-        "support_username": db_get_setting("support_username", "ARIYAN_VAI_BOSS")
-    })
-
-@web_app.route('/api/topups', methods=['POST'])
-def api_submit_topup():
-    user_id, err = require_api_user()
-    if err:
-        return err
-
-    try:
-        amount_usd = float(request.form.get("amount", "0"))
-        if amount_usd <= 0:
-            raise ValueError
-    except ValueError:
-        return jsonify({"error": "Invalid top-up amount"}), 400
-
-    dollar_rate = float(db_get_setting("dollar_rate", "1000"))
-    calc_coins = int(amount_usd * dollar_rate)
-
-    # The Telegram bot flow stores Telegram file_id. For a web upload, keep a
-    # server-side marker and the original filename for admin review.
-    uploaded = request.files.get("screenshot")
-    file_marker = "WEB_UPLOAD"
-    if uploaded and uploaded.filename:
-        file_marker = f"WEB_UPLOAD:{os.path.basename(uploaded.filename)[:120]}"
-
-    req_id = db_add_topup_request(user_id, "WEB_TXID", file_marker, calc_coins)
-
-    return jsonify({
-        "status": "success",
-        "req_id": req_id,
-        "coins": calc_coins
-    })
-
-@web_app.route('/api/referral', methods=['GET'])
-def api_referral():
-    user_id, err = require_api_user()
-    if err:
-        return err
-
-    u = db_get_user(user_id)
-    bot = db_get_setting("bot_username", BOT_USERNAME).replace("@", "")
-    return jsonify({
-        "link": f"https://t.me/{bot}?start={user_id}",
-        "referral_bonus": db_get_setting("referral_bonus", "100"),
-        "ref_count": u.get("ref_count", 0),
-        "ref_credit": u.get("ref_credit", 0)
-    })
-
-@web_app.route('/api/admin/action', methods=['POST'])
-def api_admin_action():
-    user_id, err = require_api_user()
-    if err:
-        return err
-
-    if int(user_id) not in ADMIN_IDS:
-        return jsonify({"error": "Admin access required"}), 403
-
-    data = request.get_json(silent=True) or {}
-    action = data.get("action")
-
-    if action in ("bot_orders", "all_orders"):
-        rows = db_get_all_bot_orders(50)
-        return jsonify({
-            "items": [
-                {"order_id": r[0], "order_type": r[1], "status": r[2]}
-                for r in rows
-            ]
-        })
-
-    if action == "panel_balance":
-        return jsonify(get_smm_balance())
-
-    if action == "api_orders":
-        return jsonify({
-            "api_url": SMM_API_URL,
-            "configured": bool(db_get_setting("smm_api_key", ""))
-        })
-
-    if action == "services":
-        return jsonify({
-            "reaction_service_id": db_get_setting("smm_service_id", "1936"),
-            "view_service_id": db_get_setting("smm_view_service_id", "7294")
-        })
-
-    if action == "coin_rate":
-        return jsonify({
-            "welcome_bonus": db_get_setting("welcome_bonus", "500"),
-            "coin_rate": db_get_setting("coin_rate", "4.8"),
-            "view_coin_rate": db_get_setting("view_coin_rate", "4.8"),
-            "dollar_rate": db_get_setting("dollar_rate", "1000")
-        })
-
-    if action == "referral_settings":
-        return jsonify({
-            "referral_bonus": db_get_setting("referral_bonus", "100")
-        })
-
-    if action == "users":
-        users = db_get_all_users()
-        items = []
-        for uid, u in users.items():
-            items.append({
-                "user_id": uid,
-                "username": u.get("username", ""),
-                "credit": u.get("credit", 0),
-                "ref_count": u.get("ref_count", 0),
-                "ref_credit": u.get("ref_credit", 0),
-                "blocked": bool(u.get("is_blocked", 0))
-            })
-        return jsonify({"items": items[:100]})
-
-    if action == "search_user":
-        target = str(data.get("user_id", "")).strip()
-        if not target:
-            return jsonify({"error": "user_id is required"}), 400
-        u = db_get_user(target)
-        if not u:
-            return jsonify({"error": "User not found"}), 404
-        return jsonify({
-            "user_id": target,
-            "username": u.get("username", ""),
-            "credit": u.get("credit", 0),
-            "ref_count": u.get("ref_count", 0),
-            "ref_credit": u.get("ref_credit", 0),
-            "projects": u.get("projects", []),
-            "blocked": bool(u.get("is_blocked", 0))
-        })
-
-    if action == "broadcast":
-        text = str(data.get("text", "")).strip()
-        if not text:
-            return jsonify({"error": "Broadcast text is required"}), 400
-
-        # Run through the bot event loop by scheduling an async task.
-        # This endpoint is intentionally limited to the existing admin.
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(broadcast_from_web(text))
-            return jsonify({"message": "Broadcast queued"})
-        except RuntimeError:
-            return jsonify({"error": "Bot event loop is not available"}), 503
-
-    if action in ("replace_off", "refill_off", "canceled", "failed_partial", "super_service"):
-        return jsonify({"message": f"{action} is available in the bot admin flow."})
-
-    return jsonify({"error": "Unknown admin action"}), 400
-
-async def broadcast_from_web(text):
-    all_users = db_get_all_users()
-    for uid, uinfo in all_users.items():
-        if uinfo.get("is_blocked", 0) == 1:
-            continue
-        try:
-            await application_bot.send_message(
-                chat_id=int(uid),
-                text=f"📢 নোটিশ:\n\n{text}"
-            )
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-
 if __name__ == '__main__':
     keep_alive()
-
-    global application_bot
-    application_bot = None
     
     app = (
         ApplicationBuilder()
@@ -2034,7 +2043,6 @@ if __name__ == '__main__':
         .get_updates_read_timeout(30)
         .build()
     )
-    application_bot = app.bot
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -2082,7 +2090,9 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('admin', admin_panel_command))
     
     app.add_handler(MessageHandler(filters.Regex("^(👥 Refer & Earn)$"), handle_refer_and_earn))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu))
 
     logger.info("🤖 Reaction SMM Engine Active...")
+    
     app.run_polling(allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"])
